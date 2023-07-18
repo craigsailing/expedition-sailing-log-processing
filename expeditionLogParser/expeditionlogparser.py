@@ -23,10 +23,11 @@ class LogFilter:
 
 
 def convert_time(timestamp):
-    # Note about time formats.
+    # Note about time formats. Expedition uses Xls epoc time.
     # Unix Epoc time is number of seconds since Jan 1 1970 fractions of seconds are fractions in float
     # MS Excel date time starts on Jan 1 1900 and counts forward where 1 unit is a day.
-    # Excel to epoc value DATE(1970,1,1))*86400
+    # As a ref conversion in Excel to epoc value DATE(1970,1,1))*86400
+    # As a ref Conversion in Tableau calc would be Datetime(value + INT(#30 December 1899"))
 
     # Convert from XLS format to string
     datetime_date = xlrd.xldate_as_datetime(float(timestamp), 0)
@@ -92,6 +93,8 @@ def read_log_v8(columns_to_keep, log_file, output_file, process_header, log_filt
     version_string = log_file.readline().strip()
     headers = []
 
+    leg_name = os.path.basename(os.path.dirname(log_file.name))  # The directory will be used as the leg name
+
     # Build dict of Variables to keep and the Index to us for mapping. Utc=0 BSP=1 etc.
     if 'Boat' in header and version_string.startswith('!v'):
         headers = header.split(",")
@@ -117,6 +120,7 @@ def read_log_v8(columns_to_keep, log_file, output_file, process_header, log_filt
         try:
             data = line.strip().split(",")
             data_pairs = dict(zip(headers, data))
+            data_pairs["Leg_Name"] = leg_name
             data_final = {key: data_pairs.get(key, '') for key in columns_to_keep}
 
             # Filter if there is no instrument data.
@@ -155,9 +159,12 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
     version_string = log_file.readline().strip()
     header_index = {}
 
+    leg_name = os.path.basename(os.path.dirname(log_file.name))  # The directory will be used as the leg name
+
     # Build dict of Variables to keep and the Index to us for mapping. Utc=0 BSP=1 etc.
     if header.startswith("!Boat") and index.startswith("!boat") and version_string.startswith("!v"):
         headers = dict(zip(header.split(","), index.split(",")))
+        headers["Leg_Name"] = 'Leg_Name'
         header_index = {headers[key]: key for key in columns_to_keep}
 
     # Build CSV header
@@ -201,6 +208,9 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
 
             if log_filter.drop_zero_speed and float(data_to_keep['BSP']) == 0 and float(data_to_keep['SOG']) == 0:
                 continue
+
+            if "Leg_Name" in header_index:
+                data_to_keep["Leg_Name"] = leg_name
 
             if counter >= log_filter.subsample:
                 counter = 1
