@@ -1,5 +1,6 @@
 import csv
 import getopt
+import math
 import os
 import sys
 import xlrd
@@ -7,19 +8,95 @@ import xlrd
 from packaging import version
 
 
+class PolarPoint:
+    x = 0
+    y = 0
+    twa = 0
+    tws = 0
+    velocity = 0
+    inferred = False
+
+    def __init__(self, twa: int, tws: int, velocity: float, inferred: bool):
+        self.twa = twa
+        self.tws = tws
+        self.velocity = velocity
+        self.y = round(math.cos(math.radians(twa)) * velocity, 5)
+        self.x = round(math.sin(math.radians(twa)) * velocity, 5)
+        self.inferred = inferred
+
+
+class Polars:
+    name = "BoatType"
+    twa_range = []
+    tws_range = []
+    polar_data = dict()  # [TWA][TWS][Value] Dict of TWA each one with a Dict of TWS at the prev TWA
+
+    def get_polar_target(self, twa: int, tws: int):
+        return self.polar_data[twa][tws].velocity
+
+    def get_polar_closest_polar_target(self, twa: int, tws: int):
+        twa = abs(twa)
+        twa_closest = self.twa_range[min(range(len(self.twa_range)), key=lambda i: abs(self.twa_range[i] - twa))]
+        tws_closest = self.tws_range[min(range(len(self.tws_range)), key=lambda i: abs(self.tws_range[i] - tws))]
+        try:
+            target = self.polar_data[twa_closest][tws_closest].velocity
+        except KeyError:
+            # Set to 0 if there is not a polar for some reason at this index. Can happen when polar files are partial
+            target = 0
+        return target
+
+    def load_expedition_format(self, input_file: str):
+        #  Blue-water and Expedition follow this format of TWA TWS1 BSP1 TWST2 BSP2 on single row
+        print("Loading Polar File: " + input_file)
+
+        with open(input_file, newline='') as f:
+            line1 = f.readline().strip()
+            if line1 != "!Expedition polar":
+                print("File format not correct. Expedition expected line 1 to be: !Expedition polar")
+
+            for line in f:
+                line = line.strip()
+                data = line.split('\t')
+
+                tws = 0
+                twa = 0
+                for index, item in enumerate(data):
+                    if index == 0:
+                        tws = int(round(float(item)))
+                        self.tws_range.append(tws)
+                        continue
+
+                    if index % 2 == 0:
+                        bsp = float(item)
+                        polar_point = PolarPoint(twa, int(tws), bsp, False)
+                        self.polar_data[twa][tws] = polar_point
+
+                    else:
+                        twa = int(round(float(item)))
+                        if twa not in self.twa_range:
+                            self.twa_range.append(twa)
+                            self.polar_data[twa] = dict()
+
+
 class LogFilter:
     # This class is used to build up all the parameters used in processing the log file.
     # Convenient way to group and pass this dara along the code path.
-    drop_zero_speed: bool = False  # Default to keep all data no cleanup
-    subsample: int = 1  # Default to all lines no sub sampling.
-    average_samples: int = 0  # Default is no averaging
-    convert_time = False
+    apply_filter: bool = False  # Apply the filter default is off
+    drop_min_speed: int = 1  # Will drop samples below this boat speed
+    drop_min_wind_angle: int = 10  # Will drop sample with wind outside -5 to 5 and 175-180 and -175 - 180
+    drop_min_windspeed: int = 1  # Will drop samples with wind below this level
 
-    def __init__(self, drop_zero_speed=False, subsample=1, convert_time_format=False, average_samples=0):
-        self.drop_zero_speed = drop_zero_speed
+    subsample: int = 1  # Default to all lines no sub sampling.
+    time_window: int = 60  # Default window size used for event detection samples are 1 per sec in most logs
+    average_samples: int = 0  # Default is no averaging (not implemented yet!)
+    convert_time = False  # Converts time in the log from xls epoc to string format y:m:d h:m:s
+
+    def __init__(self, apply_filter=False, subsample=1, convert_time_format=False, average_samples=0, polar_data=None):
+        self.apply_filter = apply_filter
         self.subsample = subsample
         self.average_samples = average_samples
         self.convert_time = convert_time_format
+        self.polar_data = polar_data
 
 
 def convert_time(timestamp):
@@ -32,6 +109,14 @@ def convert_time(timestamp):
     # Convert from XLS format to string
     datetime_date = xlrd.xldate_as_datetime(float(timestamp), 0)
     return datetime_date.strftime("%m/%d/%Y %H:%M:%S")
+
+
+def convert_float(s):
+    try:
+        i = float(s)
+    except ValueError:
+        i = ''
+    return i
 
 
 def process_files(log_input, output_file, columns_to_keep, log_filter):
@@ -119,16 +204,31 @@ def read_log_v8(columns_to_keep, log_file, output_file, process_header, log_filt
         # If items is missing use '' get is used to set the default.
         try:
             data = line.strip().split(",")
-            data_pairs = dict(zip(headers, data))
+            data_pairs = dict(zip(headers, [convert_float(i) for i in data]))
+
+            # Add extra calculated columns
             data_pairs["Leg_Name"] = leg_name
+            data_pairs["Tack_Gybe_Detect"] = 0
+
             data_final = {key: data_pairs.get(key, '') for key in columns_to_keep}
 
-            # Filter if there is no instrument data.
+            # --- Filter out lines if there is no instrument data present.
+
             if data_final['BSP'] == '' or data_final['Lat'] == '' or data_final['Lon'] == '':
                 continue  # boat is on and recording but no instruments are enabled.
 
-            if log_filter.drop_zero_speed and float(data_final['BSP']) == 0 and float(data_final['SOG']) == 0:
-                continue
+            if log_filter.apply_filter:
+                if data_final['BSP'] <= log_filter.drop_min_speed:
+                    continue
+
+                if data_final['TWS'] <= log_filter.drop_min_windspeed:
+                    continue
+
+                if abs(data_final['TWA']) <= log_filter.drop_min_wind_angle or \
+                        abs(data_final['TWA']) >= (180 - log_filter.drop_min_wind_angle):
+                    continue
+
+            # --- end of filter section
 
             if log_filter.convert_time:  # Convert Excel time to a string
                 data_final['Utc'] = convert_time(data_final['Utc'])
@@ -145,8 +245,7 @@ def read_log_v8(columns_to_keep, log_file, output_file, process_header, log_filt
             # Print any info to help with debug if code hits this area.
             print('Dropping a log line that is partial or not parsed correctly.')
             print('Log line :' + line)
-            print(e)
-            # print(type(e))
+            print(type(e))
 
 
 def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_filter):
@@ -164,7 +263,13 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
     # Build dict of Variables to keep and the Index to us for mapping. Utc=0 BSP=1 etc.
     if header.startswith("!Boat") and index.startswith("!boat") and version_string.startswith("!v"):
         headers = dict(zip(header.split(","), index.split(",")))
+
+        # Add calculated columns
         headers["Leg_Name"] = 'Leg_Name'
+        headers["Leg_Name"] = 'Leg_Name'
+        headers["Tack_Gybe_Detect"] = 'Tack_Gybe_Detect'
+        headers["Target_BSP"] = 'Target_BSP'
+
         header_index = {headers[key]: key for key in columns_to_keep}
 
     # Build CSV header
@@ -176,7 +281,10 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
         data_writer.writeheader()
         output_file.flush()
 
-    counter = 1
+    sub_counter = 1
+    window_counter = 1
+    data_window_current = []
+
     for line in log_file:
         if '!boat' in line or '!Boat' in line or '!v' in line:
             # Drop any new header lines assume we do not change version on the same day. (Simple solution for now)
@@ -191,32 +299,76 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
             for i in data:
                 if index % 2 == 0 and i.isdigit():
                     key = i
-                    value = data[index + 1]
-
+                    value = convert_float(data[index + 1])
                     # if the value is one to keep print it to the new true clean csv.
                     if key in header_index:
                         data_to_keep[header_index[key]] = value
 
                         if log_filter.convert_time and header_index[key] == "Utc":
                             data_to_keep[header_index[key]] = convert_time(value)
-
                 index += 1
 
-            # Filter out lines if there is no instrument data present.
+            # --- Filter out lines if there is no instrument data present.
             if 'Lat' not in data_to_keep or 'Lon' not in data_to_keep:
-                continue  # boat is on and recording but no instruments are enabled.
+                continue  # boat is on and recording but no instruments are enabled gps is missing.
+            if 'TWS' not in data_to_keep or 'TWA' not in data_to_keep:
+                continue  # boat is on and recording but no instruments are enabled wind is missing.
 
-            if log_filter.drop_zero_speed and float(data_to_keep['BSP']) == 0 and float(data_to_keep['SOG']) == 0:
-                continue
+            if log_filter.apply_filter:
+                if data_to_keep['BSP'] <= log_filter.drop_min_speed:
+                    continue
 
+                if data_to_keep['TWS'] <= log_filter.drop_min_windspeed:
+                    continue
+
+                if abs(data_to_keep['TWA']) <= log_filter.drop_min_wind_angle or \
+                        abs(data_to_keep['TWA']) >= (180 - log_filter.drop_min_wind_angle):
+                    continue
+            # --- end of filter section
+
+            # --- Add calculated columns now
             if "Leg_Name" in header_index:
                 data_to_keep["Leg_Name"] = leg_name
 
-            if counter >= log_filter.subsample:
-                counter = 1
-                data_writer.writerow(data_to_keep)
+            if "Tack_Gybe_Detect" in header_index:
+                data_to_keep["Tack_Gybe_Detect"] = 0
+
+            if "Target_BSP" in header_index and log_filter.polar_data:
+                data_to_keep["Target_BSP"] = log_filter.polar_data.get_polar_closest_polar_target(data_to_keep['TWA'],
+                                                                                                  data_to_keep['TWS'])
+            # --- end of calculated columns
+
+            # Windowing ----- ProtoType
+
+            if window_counter < log_filter.time_window:
+                window_counter += 1
+                if sub_counter >= log_filter.subsample:
+                    sub_counter = 1
+                    data_window_current.append(data_to_keep)
+                else:
+                    # Drop samples until the counter is hit every nth sample
+                    sub_counter += 1
             else:
-                counter += 1
+                # End of the processing window. process file in windows or blocks setup by log_filter.time_window
+                window_counter += 1
+                data_window_current.append(data_to_keep)
+
+                # Check the window id we tacked or gybed and mark the entire band as maneuver happened in this period.
+                if "Tack_Gybe_Detect" in header_index:
+                    min_twa = min(data_window_current, key=lambda x: x['TWA'])
+                    max_twa = max(data_window_current, key=lambda x: x['TWA'])
+                    # Did the boat tack or gybe in the time window?
+
+                    if min_twa['TWA'] * max_twa['TWA'] < 0:  # There is a + and - wind angle.
+                        # print("Tack / Gybe : " + str(min_twa['TWA']) + ":" + str(max_twa['TWA']))
+                        [x.update({'Tack_Gybe_Detect': 1}) for x in data_window_current]  # this may be slow ?
+                        # Need to work on this still.
+
+                # Clear out the window at the end. Maybe remove from the front when we get to the end and modulo this?
+                data_writer.writerows(data_window_current)
+                data_window_current.clear()
+                window_counter = 1
+            # ----
 
         except Exception as e:
             # Drop line as formatting is off simpler to drop the line than try and recover for now.
@@ -224,8 +376,8 @@ def read_log_v16(columns_to_keep, log_file, output_file, process_header, log_fil
             # Print any information to help with debug if code hits this area.
             print('Dropping a log line that is partial or not parsed correctly.')
             print('Log line :' + line)
+            print(type(e))
             print(e)
-            # print(type(e))
 
 
 def read_extract_keys():
@@ -242,8 +394,10 @@ def read_extract_keys():
 
 def print_help():
     print('expedtionlogparser.py -i <input file or directory> -o <output file>')
-    print('optional params: [-s 10 subsample rate each 10th sample] [-d delete 0 speed entries]')
+    print('optional params: [-s 10 subsample rate each 10th sample]]')
+    print('optional params: [-d drop values outside filter ranges]')
     print('optional params: [-t converts excel time to string]')
+    print('optional params: [-p Polar file, if provided the logs will merge in % of target speed for TWA and TWS]')
     print('Default output file if -o is not provided is MergedData.csv in the working directory')
     sys.exit(2)
 
@@ -251,15 +405,18 @@ def print_help():
 def main(argv):
     log_input = ""
     output_file = "MergedData.csv"  # Default output merged file.
-    drop_zero_speed = False
+    apply_filter = False
     subsample = 1  # default is keep all lines else sample each x entry
     convert_time_format = False
+    polar_file = None
+    polar_data = None
 
     # Set up the columns you need to keep in the extract.cfg file.
     # columns_to_keep = []
 
     try:
-        opts, args = getopt.getopt(argv, "i:o:s:hdt", ["ifile=", "ofile=", "subsample=number"])
+        opts, args = getopt.getopt(argv, "i:o:s:p:hdt", ["ifile=", "ofile=", "subsample=number",
+                                                         "convert_time_to_string", "polar_file"])
         for opt, arg in opts:
             if opt == '-h':
                 print_help()
@@ -268,11 +425,13 @@ def main(argv):
             elif opt in ("-o", "--ofile"):
                 output_file = arg
             elif opt in ("-d", "--drop_zero_speed"):
-                drop_zero_speed = True
+                apply_filter = True
             elif opt in ("-s", "--subsample"):
                 subsample = int(arg)
             elif opt in ("-t", "--convert_time_to_string"):
                 convert_time_format = True
+            elif opt in ("-p", "--polar_file"):
+                polar_file = arg
             else:
                 print('Unknown parameter:' + opt)
                 print_help()
@@ -280,16 +439,19 @@ def main(argv):
         print_help()
 
     columns_to_keep = read_extract_keys()
-    log_filter = LogFilter(drop_zero_speed, subsample, convert_time_format, 0)
+
+    if polar_file:
+        polar_data = Polars()
+        polar_data.load_expedition_format(polar_file)
+
+    log_filter = LogFilter(apply_filter, subsample, convert_time_format, 0, polar_data)
     process_files(log_input, output_file, columns_to_keep, log_filter)
 
 
 if __name__ == '__main__':
     main(sys.argv[1:])
 
-# Notes on future changes we may add or work on:
-# KLM file format export to make easy to use Google Earth and maps with your tracks
-# Drop data from file that is far from polar data.
-# Drop data when taking, gybing and or in broach.
-# Windowed time averages, sample the data over time window and return the average or median values.
-# Keep up with Expedition's file format changes etc.
+# Notes on future changes we may add or work on: KLM file format export to make easy to use Google Earth and maps
+# with your tracks Drop data from file that is far from polar data. Drop data when taking, gybing and or in broach.
+# Windowed time averages, sample the data over time window and return the average or median values. Preserve Local
+#   preserving Max and Min values. Keep up with Expedition's file format changes etc.
